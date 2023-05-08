@@ -238,14 +238,6 @@ bool rf_mbus::task() {
     // decode
     uint16_t rxStatus = PACKET_UNKNOWN_ERROR;
     uint16_t rxLength = 0;
-    Serial.print("wMBus-lib: L=");
-    Serial.print(RXinfo.length);
-    Serial.print(" l=");
-    Serial.println(packetSize(RXinfo.lengthField));
-    Serial.print("wMBus-lib: Frame: ");
-    for (int ii=0; ii < (RXinfo.length + 2); ii++) {
-      Serial.printf(", 0x%02X", (int)(this->MBbytes[ii]));
-    }
     Serial.println("");
     if (RXinfo.framemode == WMBUS_T1_MODE) {
       Serial.println("wMBus-lib: Processing T1 A frame");
@@ -263,6 +255,16 @@ bool rf_mbus::task() {
         rxStatus = verifyCrcBytesCmodeB(this->MBbytes + 2, this->MBpacket, rxLength);
       }
     }
+    
+    Serial.print("wMBus-lib: L=");
+    Serial.print(RXinfo.length);
+    Serial.print(" l=");
+    Serial.println(packetSize(RXinfo.lengthField));
+    Serial.print("wMBus-lib: Frame: ");
+    for (int ii=0; ii < (RXinfo.length + 2); ii++) {
+      Serial.printf("%02X", (int)(this->MBpacket[ii]));
+    }
+    Serial.println("");
 
     if (rxStatus == PACKET_OK) {
       this->returnFrame.framemode = RXinfo.framemode;
