@@ -6,6 +6,7 @@
 #define _RF_MBUS_H
 
 #include <stdint.h>
+#include <string>
 
 //----------------------------------------------------------------------------------
 //  Constants 
@@ -42,22 +43,66 @@
 #define FIXED_PACKET_LENGTH        0x00
 #define INFINITE_PACKET_LENGTH     0x02
 
+enum WmBusFrameType : uint8_t {
+  WMBUS_FRAME_UNKNOWN = 0,
+  WMBUS_FRAMEA = 1,
+  WMBUS_FRAMEB = 2,
+};
+
+enum WmBusFrameMode : uint8_t {
+  WMBUS_UNKNOWN_MODE = 0,
+  WMBUS_T1_MODE = 1,
+  WMBUS_C1_MODE = 2,
+};
+
 typedef struct RXinfoDescr {
-    uint8_t  lengthField;         // The L-field in the WMBUS packet
-    uint16_t length;              // Total number of bytes to to be read from the RX FIFO
-    uint16_t bytesLeft;           // Bytes left to to be read from the RX FIFO
-    uint8_t *pByteIndex;          // Pointer to current position in the byte array
-    bool start;                   // Start of Packet
-    bool complete;                // Packet received complete
-    uint8_t state;
+  uint8_t  lengthField;         // The L-field in the WMBUS packet
+  uint16_t length;              // Total number of bytes to to be read from the RX FIFO
+  uint16_t bytesLeft;           // Bytes left to to be read from the RX FIFO
+  uint8_t *pByteIndex;          // Pointer to current position in the byte array
+  bool start;                   // Start of Packet
+  bool complete;                // Packet received complete
+  uint8_t state;
+  WmBusFrameMode framemode;
+  WmBusFrameType frametype;
 } RXinfoDescr;
 
+typedef struct WMbusFrame {
+  std::vector<unsigned char> frame{};
+  WmBusFrameMode framemode;
+  int8_t rssi;
+  uint8_t lqi;
+} WMbusFrame;
 
 //----------------------------------------------------------------------------------
 //  Function declarations
 //----------------------------------------------------------------------------------
-uint8_t rf_mbus_on(bool force = true);
-bool rf_mbus_init(uint8_t mosi, uint8_t miso, uint8_t clk, uint8_t cs, uint8_t gdo0, uint8_t gdo2);
-bool rf_mbus_task(uint8_t* MBpacket, int8_t &rssi, uint8_t &lqi, uint8_t gdo0, uint8_t gdo2);
+const std::string mode_to_string(WmBusFrameMode mode);
+
+class rf_mbus {
+  public:
+    bool init(uint8_t mosi, uint8_t miso, uint8_t clk, uint8_t cs, uint8_t gdo0, uint8_t gdo2);
+    bool task();
+    WMbusFrame get_frame();
+
+
+  private:
+    uint8_t start(bool force = true);
+
+    uint8_t gdo0{0};
+    uint8_t gdo2{0};
+    
+    uint8_t MBbytes[584];
+    uint8_t MBpacket[291];
+
+    WMbusFrame returnFrame;
+
+    RXinfoDescr RXinfo;
+
+    uint32_t sync_time_{0};
+    uint8_t extra_time_{20};
+    uint8_t max_wait_time_ = extra_time_;
+
+};
 
 #endif
