@@ -1,4 +1,5 @@
 #include "utils.hpp"
+#include "crc.hpp"
 #include "rf_mbus.hpp"
 #include "mbus_packet.hpp"
 #include "3outof6.hpp"
@@ -6,15 +7,18 @@
 
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 
-uint8_t MBbytes[584];
+const std::string mode_to_string(WmBusFrameMode mode) {
+  switch (mode) {
+    case WMBUS_T1_MODE:
+      return "T1";
+    case WMBUS_C1_MODE:
+      return "C1";
+    default:
+      return "unknown";
+  }
+}
 
-RXinfoDescr RXinfo;
-
-uint32_t sync_time_{0};
-uint8_t extra_time_ = 20;
-uint8_t max_wait_time_ = extra_time_;
-
-uint8_t rf_mbus_on(bool force) {
+uint8_t rf_mbus::start(bool force) {
   // waiting to long for next part of data?
   bool reinit_needed = ((millis() - sync_time_) > max_wait_time_) ? true: false;
 
@@ -38,13 +42,20 @@ uint8_t rf_mbus_on(bool force) {
   ELECHOUSE_cc1101.SpiStrobe(CC1101_SFRX);  //flush RXfifo
 
   // Initialize RX info variable
-  RXinfo.lengthField = 0;           // Length Field in the wireless MBUS packet
-  RXinfo.length      = 0;           // Total length of bytes to receive packet
-  RXinfo.bytesLeft   = 0;           // Bytes left to to be read from the RX FIFO
-  RXinfo.pByteIndex  = MBbytes;     // Pointer to current position in the byte array
-  RXinfo.complete    = false;       // Packet Received
+  RXinfo.lengthField = 0;              // Length Field in the wireless MBUS packet
+  RXinfo.length      = 0;              // Total length of bytes to receive packet
+  RXinfo.bytesLeft   = 0;              // Bytes left to to be read from the RX FIFO
+  RXinfo.pByteIndex  = this->MBbytes;  // Pointer to current position in the byte array
+  RXinfo.complete    = false;          // Packet Received
+  RXinfo.framemode   = WMBUS_UNKNOWN_MODE;
+  RXinfo.frametype   = WMBUS_FRAME_UNKNOWN;
 
-  memset(MBbytes, 0, sizeof(MBbytes));
+  memset(this->MBbytes, 0, sizeof(this->MBbytes));
+  memset(this->MBpacket, 0, sizeof(this->MBpacket));
+  this->returnFrame.frame.clear();
+  this->returnFrame.rssi = 0;
+  this->returnFrame.lqi = 0;
+  this->returnFrame.framemode = WMBUS_UNKNOWN_MODE;
 
   // Set RX FIFO threshold to 4 bytes
   ELECHOUSE_cc1101.SpiWriteReg(CC1101_FIFOTHR, RX_FIFO_START_THRESHOLD);
@@ -59,11 +70,21 @@ uint8_t rf_mbus_on(bool force) {
   return 1; // this will indicate we just have re-started RX
 }
 
-bool rf_mbus_init(uint8_t mosi, uint8_t miso, uint8_t clk, uint8_t cs, uint8_t gdo0, uint8_t gdo2) {
+WMbusFrame rf_mbus::get_frame() {
+  // ToDo: Add CRC removal for Frame B
+  uint8_t len_without_crc = crcRemove(this->MBpacket, packetSize(this->MBpacket[0]));
+  std::vector<unsigned char> frame(this->MBpacket, this->MBpacket + len_without_crc);
+  this->returnFrame.frame = frame;
+  return this->returnFrame;
+}
+
+bool rf_mbus::init(uint8_t mosi, uint8_t miso, uint8_t clk, uint8_t cs, uint8_t gdo0, uint8_t gdo2) {
   bool retVal = false;
   Serial.println("");
-  pinMode(gdo0, INPUT);
-  pinMode(gdo2, INPUT);
+  this->gdo0 = gdo0;
+  this->gdo2 = gdo2;
+  pinMode(this->gdo0, INPUT);
+  pinMode(this->gdo2, INPUT);
   ELECHOUSE_cc1101.setSpiPin(clk, miso, mosi, cs);
 
   ELECHOUSE_cc1101.Init();
@@ -94,19 +115,19 @@ bool rf_mbus_init(uint8_t mosi, uint8_t miso, uint8_t clk, uint8_t cs, uint8_t g
   return retVal;
 }
 
-bool rf_mbus_task(uint8_t* MBpacket, int8_t &rssi, uint8_t &lqi, byte gdo0, byte gdo2) {
+bool rf_mbus::task() {
   uint8_t bytesDecoded[2];
 
   switch (RXinfo.state) {
     case 0:
       {
-        rf_mbus_on();
+        start();
       }
       return false;
 
      // RX active, awaiting SYNC
     case 1:
-      if (digitalRead(gdo2)) {
+      if (digitalRead(this->gdo2)) {
         RXinfo.state = 2;
         sync_time_ = millis();
       }
@@ -114,23 +135,66 @@ bool rf_mbus_task(uint8_t* MBpacket, int8_t &rssi, uint8_t &lqi, byte gdo0, byte
 
     // awaiting pkt len to read
     case 2:
-      if (digitalRead(gdo0)) {
+      if (digitalRead(this->gdo0)) {
         // Read the 3 first bytes
         ELECHOUSE_cc1101.SpiReadBurstReg(CC1101_RXFIFO, RXinfo.pByteIndex, 3);
 
         // - Calculate the total number of bytes to receive -
+
+        // In C-mode we allow receiving T-mode because they are similar. To not break any applications using T-mode,
+        // we do not include results from C-mode in T-mode.
+
+        // If T-mode preamble and sync is used, then the first data byte is either a valid 3outof6 byte or C-mode
+        // signaling byte. (http://www.ti.com/lit/an/swra522d/swra522d.pdf#page=6)
+        if (RXinfo.pByteIndex[0] == 0x54) {
+          RXinfo.framemode = WMBUS_C1_MODE;
+          // If we have determined that it is a C-mode frame, we have to determine if it is Type A or B.
+          if (RXinfo.pByteIndex[1] == 0xCD) {
+            RXinfo.frametype = WMBUS_FRAMEA;
+
+            // Frame format A
+            RXinfo.lengthField = RXinfo.pByteIndex[2];
+
+            if (RXinfo.lengthField < 9) {
+              RXinfo.state = 0;
+              return false;
+            }
+
+            // Number of CRC bytes = 2 * ceil((L-9)/16) + 2
+            // Preamble + L-field + payload + CRC bytes
+            RXinfo.length = 2 + 1 + RXinfo.lengthField + 2 * (2 + (RXinfo.lengthField - 10)/16);
+          } else if (RXinfo.pByteIndex[1] == 0x3D) {
+            RXinfo.frametype = WMBUS_FRAMEB;
+            // Frame format B
+            RXinfo.lengthField = RXinfo.pByteIndex[2];
+
+            if (RXinfo.lengthField < 12 || RXinfo.lengthField == 128) {
+              RXinfo.state = 0;
+              return false;
+            }
+
+            // preamble + L-field + payload
+            RXinfo.length = 2 + 1 + RXinfo.lengthField;
+          } else {
+            // Unknown type, reset.
+            RXinfo.state = 0;
+            return false;
+          }
         // T-Mode
         // Possible improvment: Check the return value from the deocding function,
-        // and abort RX if coding error. 
-        if (decode3outof6(RXinfo.pByteIndex, bytesDecoded, 0) != DECODING_3OUTOF6_OK) {
+        // and abort RX if coding error.
+        } else if (decode3outof6(RXinfo.pByteIndex, bytesDecoded, 0) != DECODING_3OUTOF6_OK) {
           RXinfo.state = 0;
           return false;
-	      }		
-        RXinfo.lengthField = bytesDecoded[0];
-        RXinfo.length = byteSize(packetSize(RXinfo.lengthField));
+        } else {
+          RXinfo.framemode = WMBUS_T1_MODE;
+          RXinfo.frametype = WMBUS_FRAMEA;
+          RXinfo.lengthField = bytesDecoded[0];
+          RXinfo.length = byteSize(packetSize(RXinfo.lengthField));
+        }
 
         // check if incoming data will fit into buffer
-        if (RXinfo.length>sizeof(MBbytes)) {
+        if (RXinfo.length>sizeof(this->MBbytes)) {
           RXinfo.state = 0;
           return false;
         }
@@ -152,7 +216,7 @@ bool rf_mbus_task(uint8_t* MBpacket, int8_t &rssi, uint8_t &lqi, byte gdo0, byte
 
     // awaiting more data to be read
     case 3:
-      if (digitalRead(gdo0)) {
+      if (digitalRead(this->gdo0)) {
         // Read out the RX FIFO
         // Do not empty the FIFO (See the CC110x or 2500 Errata Note)
         uint8_t bytesInFIFO = ELECHOUSE_cc1101.SpiReadStatus(CC1101_RXBYTES) & 0x7F;        
@@ -172,27 +236,53 @@ bool rf_mbus_task(uint8_t* MBpacket, int8_t &rssi, uint8_t &lqi, byte gdo0, byte
     ELECHOUSE_cc1101.SpiReadBurstReg(CC1101_RXFIFO, RXinfo.pByteIndex, (uint8_t)RXinfo.bytesLeft);
 
     // decode
-    uint16_t rxStatus = PACKET_CODING_ERROR;
-    rxStatus = decodeRXBytesTmode(MBbytes, MBpacket, packetSize(RXinfo.lengthField));
+    uint16_t rxStatus = PACKET_UNKNOWN_ERROR;
+    uint16_t rxLength = 0;
+    Serial.print("wMBus-lib: L=");
+    Serial.print(RXinfo.length);
+    Serial.print(" l=");
+    Serial.println(packetSize(RXinfo.lengthField));
+    Serial.print("wMBus-lib: Frame: ");
+    for (int ii=0; ii < (RXinfo.length + 2); ii++) {
+      Serial.printf(", 0x%02X", (int)(this->MBbytes[ii]));
+    }
+    Serial.println("");
+    if (RXinfo.framemode == WMBUS_T1_MODE) {
+      Serial.println("wMBus-lib: Processing T1 A frame");
+      rxStatus = decodeRXBytesTmode(this->MBbytes, this->MBpacket, packetSize(RXinfo.lengthField));
+      rxLength = packetSize(this->MBpacket[0]);
+    } else if (RXinfo.framemode == WMBUS_C1_MODE) {
+      if (RXinfo.frametype == WMBUS_FRAMEA) {
+        Serial.println("wMBus-lib: Processing C1 A frame");
+//         2 + 1 + RXinfo.lengthField + 2 * (2 + (RXinfo.lengthField - 10)/16);
+        rxLength = RXinfo.lengthField + 2 * (2 + (RXinfo.lengthField - 10)/16) + 1;
+        rxStatus = verifyCrcBytesCmodeA(this->MBbytes + 2, this->MBpacket, rxLength);
+      } else if (RXinfo.frametype == WMBUS_FRAMEB) {
+        Serial.println("wMBus-lib: Processing C1 B frame");
+        rxLength = RXinfo.lengthField + 1;
+        rxStatus = verifyCrcBytesCmodeB(this->MBbytes + 2, this->MBpacket, rxLength);
+      }
+    }
 
     if (rxStatus == PACKET_OK) {
+      this->returnFrame.framemode = RXinfo.framemode;
       RXinfo.complete = true;
-      rssi = (int8_t)ELECHOUSE_cc1101.getRssi();
-      lqi = (uint8_t)ELECHOUSE_cc1101.getLqi();
+      this->returnFrame.rssi = (int8_t)ELECHOUSE_cc1101.getRssi();
+      this->returnFrame.lqi = (uint8_t)ELECHOUSE_cc1101.getLqi();
     }
     else if (rxStatus == PACKET_CODING_ERROR) {
-      Serial.print("wMBus-lib: Error during decoding '3 out of 6'");
+      Serial.println("wMBus-lib:  Error during decoding '3 out of 6'");
     }
     else if (rxStatus == PACKET_CRC_ERROR) {
-      Serial.println("wMBus-lib: Error during decoding 'CRC'");
+      Serial.println("wMBus-lib:  Error during decoding 'CRC'");
     }
     else {
-      Serial.println("wMBus-lib: Error during decoding 'unknown'");
+      Serial.println("wMBus-lib:  Error during decoding 'unknown'");
     }
     RXinfo.state = 0;
     return RXinfo.complete;
   }
-  rf_mbus_on(false);
+  start(false);
 
   return RXinfo.complete;
 }
